@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# misphere - manage connection to the Xiaomi Mi Sphere 360 camera (MJXJ-XXXXXX AP)
+#
+# Usage:
+#   misphere up       connect to the camera WiFi (keeps internet via any other link)
+#   misphere down     disconnect (NetworkManager auto-reconnects your usual WiFi)
+#   misphere status   camera reachability, internet state
+#   misphere files    open SD card file browser (HTTP)
+#   misphere stream   play live preview (RTSP)
+#   misphere wake     instructions to wake the camera
+
+set -u
+
+SSID_PREFIX="MJXJ"
+CON_NAME="misphere"
+CAM_IP="192.168.42.1"
+URL_HTTP="http://${CAM_IP}:50422/"
+URL_RTSP="rtsp://${CAM_IP}/live"
+
+ssid_now() {
+    iwgetid -r wlp2s0 2>/dev/null || iw dev wlp2s0 link 2>/dev/null | awk '/SSID:/ {print $2}'
+}
+
+internet_route() {
+    ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)" dev "$(i+2); if(N==0&&found==0){}}' | head -1
+}
+
+check_internet() {
+    if ip route get 1.1.1.1 2>/dev/null | grep -qv "dev wlp2s0\|unreachable"; then
+        return 0
+    fi
+    timeout 4 curl -sfI http://1.1.1.1 >/dev/null 2>&1
+}
+
+cam_alive() {
+    ping -c1 -W2 "$CAM_IP" >/dev/null 2>&1
+}
+
+port_open() {
+    timeout 3 bash -c "echo >/dev/tcp/${CAM_IP}/7878" 2>/dev/null
+}
+
+cmd_up() {
+    local want="${1:-}"
+    if cam_alive; then
+        echo "[*] already connected to camera ($CAM_IP reachable)"
+    else
+        echo "[*] scanning for camera AP (SSID prefix '$SSID_PREFIX', 30s window)..."
+        local ssid=""
+        for _ in $(seq 1 10); do
+            nmcli dev wifi list --rescan yes >/dev/null 2>&1
+            ssid=$(nmcli -t -f SSID dev wifi list 2>/dev/null | grep -m1 "^$SSID_PREFIX")
+            [ -n "$ssid" ] && break
+            sleep 3
+        done
+        if [ -z "$ssid" ] && [ -n "$want" ]; then
+            ssid="$want"
+        fi
+        if [ -z "$ssid" ]; then
+            cat <<EOF
+[!] camera AP not visible. On the camera:
+      - short-press shutter/power to wake it (LCD lights up)
+      - press the WiFi button (side) briefly to start the hotspot
+      - if the hotspot still does not appear, hold the WiFi button
+        8-10 seconds until the LED flashes rapidly (forces AP mode)
+      - wait ~10s, then retry: $0 up
+EOF
+            exit 1
+        fi
+        if [ "$(ssid_now)" != "$ssid" ]; then
+            echo "[*] connecting to '$ssid'..."
+            nmcli con up "$CON_NAME" 2>/dev/null || { echo "[!] connect failed - create profile once with:"; echo "    nmcli con add type wifi ifname <WIFI_IF> con-name $CON_NAME ssid \"$ssid\" 802-11-wireless-security.key-mgmt wpa-psk 802-11-wireless-security.psk 12345678"; echo "    nmcli con modify $CON_NAME ipv4.never-default yes ipv6.never-default yes connection.autoconnect-priority 100"; exit 1; }
+        fi
+        for _ in $(seq 1 10); do
+            cam_alive && break
+            sleep 1
+        done
+        cam_alive || { echo "[!] connected to WiFi but camera not answering ping"; exit 1; }
+    fi
+    port_open && echo "[*] control port 7878 open" || echo "[!] port 7878 not answering (camera busy/asleep?)"
+    if check_internet; then
+        echo "[*] internet still available: $(internet_route)"
+    else
+        echo "[i] no internet while on camera WiFi (only one radio). Run '$0 down' to restore."
+    fi
+    echo "[i] camera:      $CAM_IP"
+    echo "[i] file browser: $URL_HTTP"
+    echo "[i] live preview: $URL_RTSP"
+    echo "[i] control CLI:  ./misphere.py info"
+}
+
+cmd_down() {
+    if nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep -q "^${CON_NAME}:wlp2s0"; then
+        echo "[*] disconnecting from camera..."
+        nmcli con down "$CON_NAME"
+        sleep 3
+    fi
+    echo "[*] current SSID: $(ssid_now)"
+    check_internet && echo "[*] internet OK" || echo "[!] no internet yet (autoconnect may take a moment)"
+}
+
+cmd_status() {
+    echo "wifi ssid : $(ssid_now)"
+    cam_alive && echo "camera    : reachable ($CAM_IP)" || echo "camera    : not reachable"
+    port_open && echo "port 7878 : open" || echo "port 7878 : closed/unreachable"
+    check_internet && echo "internet  : OK via $(internet_route)" || echo "internet  : none"
+}
+
+cmd_files() {
+    cam_alive || { echo "[!] camera not reachable - run: $0 up"; exit 1; }
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$URL_HTTP" >/dev/null 2>&1 &
+        echo "[*] opened $URL_HTTP"
+    else
+        echo "$URL_HTTP"
+    fi
+}
+
+cmd_stream() {
+    cam_alive || { echo "[!] camera not reachable - run: $0 up"; exit 1; }
+    if command -v ffplay >/dev/null 2>&1; then
+        exec ffplay -fflags nobuffer -rtsp_transport tcp "$URL_RTSP"
+    elif command -v vlc >/dev/null 2>&1; then
+        exec vlc "$URL_RTSP"
+    else
+        echo "[!] no ffplay/vlc found. Install: sudo apt install ffmpeg"
+        echo "    stream URL: $URL_RTSP"
+        exit 1
+    fi
+}
+
+cmd_wake() {
+    cat <<'EOF'
+Wake the camera + hotspot:
+ 1. Short-press the shutter/power button -> LCD lights up
+ 2. Long-press the WiFi button (on the side, next to micro-USB) until
+    the WiFi LED blinks -> hotspot MJXJ-XXXXXX starts (password 12345678)
+ 3. Run: misphere up
+Note: the camera auto-powers-off after ~3 min idle; do step 1 again.
+EOF
+}
+
+case "${1:-}" in
+    up)     shift; cmd_up "$@" ;;
+    down)   cmd_down ;;
+    status) cmd_status ;;
+    files)  cmd_files ;;
+    stream) cmd_stream ;;
+    wake)   cmd_wake ;;
+    *) grep '^#   ' "$0" | sed 's/^#   //' ;;
+esac
